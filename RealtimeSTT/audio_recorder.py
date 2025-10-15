@@ -1030,23 +1030,11 @@ class AudioToTextRecorder:
             )
         )
 
-        # Re-spawn stdout reader tied to the new stdout pipe
-        try:
-            if hasattr(self, "stdout_thread") and self.stdout_thread:
-                # Let old thread exit (it will when pipe closes)
-                pass
-            self.stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
-            self.stdout_thread.start()
-        except Exception:
-            logger.exception("Failed starting stdout reader after restart")
-
-        self.transcription_supervisor_thread = self._start_thread(
+        self.transcription_supervisor_thread = threading.Thread(
             target=self._supervise_transcription_worker,
+            daemon=True
         )
-
-        logger.debug('Waiting for restarted main transcription model to start')
-        self.main_transcription_ready_event.wait(timeout=30)
-        logger.debug('Restarted main transcription model ready')
+        self.transcription_supervisor_thread.start()
 
     def _restart_transcription_worker(self):
         # Stop/cleanup the old worker
@@ -1082,12 +1070,32 @@ class AudioToTextRecorder:
                 pass
 
         self._start_transcription_worker()
+        self.main_transcription_ready_event.wait(timeout=30)
+
+        # Re-spawn stdout reader tied to the new stdout pipe
+        try:
+            if hasattr(self, "stdout_thread") and self.stdout_thread:
+                # Let old thread exit (it will when pipe closes)
+                pass
+            self.stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+            self.stdout_thread.start()
+        except Exception:
+            logger.exception("Failed starting stdout reader after restart")
 
 
     def _supervise_transcription_worker(self):
+        FATAL_CHECK_INTERVAL = 1.0  # seconds
+
+        # If the thread is already running, wait a bit and check again. Avoid multiple running at once
+        if hasattr(self, "transcription_supervisor_thread") and self.transcription_supervisor_thread is not None:
+            if self.transcription_supervisor_thread.is_alive():
+                time.sleep(2 * FATAL_CHECK_INTERVAL)
+                if self.transcription_supervisor_thread.is_alive():
+                    return
+
         # Wait until fatal is signaled or shutdown is in progress
         while not self.shutdown_event.is_set():
-            if self.transcription_fatal_event.wait(timeout=2):
+            if self.transcription_fatal_event.wait(timeout=FATAL_CHECK_INTERVAL):
                 if self.shutdown_event.is_set():
                     return
                 logger.error("Transcription worker signaled FATAL; restarting.")
