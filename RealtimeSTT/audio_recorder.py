@@ -94,7 +94,7 @@ if platform.system() != 'Darwin':
 class TranscriptionWorker:
     def __init__(self, conn, stdout_pipe, model_path, download_root, compute_type, gpu_device_index, device,
                  ready_event, shutdown_event, interrupt_stop_event, beam_size, initial_prompt, suppress_tokens,
-                 batch_size, faster_whisper_vad_filter, normalize_audio):
+                 batch_size, faster_whisper_vad_filter, normalize_audio, fatal_event):
         self.conn = conn
         self.stdout_pipe = stdout_pipe
         self.model_path = model_path
@@ -112,6 +112,7 @@ class TranscriptionWorker:
         self.faster_whisper_vad_filter = faster_whisper_vad_filter
         self.normalize_audio = normalize_audio
         self.queue = queue.Queue()
+        self.fatal_event = fatal_event
 
     def custom_print(self, *args, **kwargs):
         message = ' '.join(map(str, args))
@@ -121,18 +122,20 @@ class TranscriptionWorker:
             pass
 
     def poll_connection(self):
-        while not self.shutdown_event.is_set():
+        POLL_TIMEOUT = 0.1
+        while not self.shutdown_event.is_set() and not self.fatal_event.is_set():
             try:
-                # Use a longer timeout to reduce polling frequency
-                if self.conn.poll(0.01):  # Increased from 0.01 to 0.5 seconds
-                    data = self.conn.recv()
-                    self.queue.put(data)
-                else:
-                    # Sleep only if no data, but use a shorter sleep
-                    time.sleep(TIME_SLEEP)
+                if not self.conn.poll(POLL_TIMEOUT):
+                    time.sleep(POLL_TIMEOUT)
+                    continue
+
+                data = self.conn.recv()
+                self.queue.put(data)
+
             except Exception as e:
                 logging.error(f"Error receiving data from connection: {e}", exc_info=True)
-                time.sleep(TIME_SLEEP)
+                self.fatal_event.set()
+
 
     def run(self):
         if __name__ == "__main__":
@@ -713,7 +716,6 @@ class AudioToTextRecorder:
         # ----------------------------------------------------------------------------
 
         self.is_shut_down = False
-        self.shutdown_event = mp.Event()
         
         try:
             # Only set the start method if it hasn't been set already
@@ -729,37 +731,10 @@ class AudioToTextRecorder:
             for param, value in locals().items():
                 logger.info(f"{param}: {value}")
 
-        self.interrupt_stop_event = mp.Event()
-        self.was_interrupted = mp.Event()
-        self.main_transcription_ready_event = mp.Event()
-
-        self.parent_transcription_pipe, child_transcription_pipe = SafePipe()
-        self.parent_stdout_pipe, child_stdout_pipe = SafePipe()
-
         # Set device for model
         self.device = "cuda" if self.device == "cuda" and torch.cuda.is_available() else "cpu"
 
-        self.transcript_process = self._start_thread(
-            target=AudioToTextRecorder._transcription_worker,
-            args=(
-                child_transcription_pipe,
-                child_stdout_pipe,
-                self.main_model_type,
-                self.download_root,
-                self.compute_type,
-                self.gpu_device_index,
-                self.device,
-                self.main_transcription_ready_event,
-                self.shutdown_event,
-                self.interrupt_stop_event,
-                self.beam_size,
-                self.initial_prompt,
-                self.suppress_tokens,
-                self.batch_size,
-                self.faster_whisper_vad_filter,
-                self.normalize_audio,
-            )
-        )
+        self._start_transcription_worker()
 
         # Start audio data reading process
         if self.use_microphone.value:
@@ -989,7 +964,7 @@ class AudioToTextRecorder:
         """
         if (platform.system() == 'Linux'):
             thread = threading.Thread(target=target, args=args)
-            thread.deamon = True
+            thread.daemon = True
             thread.start()
             return thread
         else:
@@ -1019,6 +994,110 @@ class AudioToTextRecorder:
     def _transcription_worker(*args, **kwargs):
         worker = TranscriptionWorker(*args, **kwargs)
         worker.run()
+
+    def _start_transcription_worker(self):
+        # New events/pipes and a fresh worker
+        self.shutdown_event = mp.Event()
+        self.interrupt_stop_event = mp.Event()
+        self.was_interrupted = mp.Event()
+        self.main_transcription_ready_event = mp.Event()
+        self.transcription_fatal_event = mp.Event()
+
+        self.parent_transcription_pipe, child_transcription_pipe = SafePipe()
+        self.parent_stdout_pipe, child_stdout_pipe = SafePipe()
+
+        logger.info("Starting transcription worker with fresh pipes/events")
+        self.transcript_process = self._start_thread(
+            target=AudioToTextRecorder._transcription_worker,
+            args=(
+                child_transcription_pipe,
+                child_stdout_pipe,
+                self.main_model_type,
+                self.download_root,
+                self.compute_type,
+                self.gpu_device_index,
+                self.device,
+                self.main_transcription_ready_event,
+                self.shutdown_event,
+                self.interrupt_stop_event,
+                self.beam_size,
+                self.initial_prompt,
+                self.suppress_tokens,
+                self.batch_size,
+                self.faster_whisper_vad_filter,
+                self.normalize_audio,
+                self.transcription_fatal_event,
+            )
+        )
+
+        # Re-spawn stdout reader tied to the new stdout pipe
+        try:
+            if hasattr(self, "stdout_thread") and self.stdout_thread:
+                # Let old thread exit (it will when pipe closes)
+                pass
+            self.stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+            self.stdout_thread.start()
+        except Exception:
+            logger.exception("Failed starting stdout reader after restart")
+
+        self.transcription_supervisor_thread = self._start_thread(
+            target=self._supervise_transcription_worker,
+        )
+
+        logger.debug('Waiting for restarted main transcription model to start')
+        self.main_transcription_ready_event.wait(timeout=30)
+        logger.debug('Restarted main transcription model ready')
+
+    def _restart_transcription_worker(self):
+        # Stop/cleanup the old worker
+        try:
+            self.shutdown_event.set()
+            if hasattr(self, "transcript_process") and self.transcript_process:
+                self.transcript_process.join(timeout=5)
+                if hasattr(self.transcript_process, "is_alive") and self.transcript_process.is_alive():
+                    logger.warning("Killing stuck transcription process")
+                    try:
+                        self.transcript_process.terminate()
+                    except Exception:
+                        pass
+
+                self.transcription_supervisor_thread.join(timeout=5)
+                if (hasattr(self.transcription_supervisor_thread, "is_alive") and
+                        self.transcription_supervisor_thread.is_alive()):
+                    logger.warning("Killing stuck transcription supervisor thread")
+                    try:
+                        self.transcription_supervisor_thread.terminate()
+                    except Exception:
+                        pass
+
+        except Exception:
+            logger.exception("Error shutting down old transcription worker")
+
+        # Close old pipes
+        for p in (getattr(self, "parent_transcription_pipe", None),
+                getattr(self, "parent_stdout_pipe", None)):
+            try:
+                if p: p.close()
+            except Exception:
+                pass
+
+        self._start_transcription_worker()
+
+
+    def _supervise_transcription_worker(self):
+        # Wait until fatal is signaled or shutdown is in progress
+        while not self.shutdown_event.is_set():
+            if self.transcription_fatal_event.wait(timeout=2):
+                if self.shutdown_event.is_set():
+                    return
+                logger.error("Transcription worker signaled FATAL; restarting.")
+                try:
+                    self._restart_transcription_worker()
+                except Exception:
+                    logger.exception("Restart of transcription worker failed")
+                # Reset for future incidents
+                self.transcription_fatal_event.clear()
+
 
     def _run_callback(self, cb, *args, **kwargs):
         if self.start_callback_in_new_thread:
