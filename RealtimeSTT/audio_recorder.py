@@ -122,7 +122,7 @@ class TranscriptionWorker:
             pass
 
     def poll_connection(self):
-        POLL_TIMEOUT = 0.1
+        POLL_TIMEOUT = 0.05
         while not self.shutdown_event.is_set() and not self.fatal_event.is_set():
             try:
                 if not self.conn.poll(POLL_TIMEOUT):
