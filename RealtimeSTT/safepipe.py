@@ -2,7 +2,6 @@ import sys
 import multiprocessing as mp
 import queue
 import threading
-import time
 import logging
 
 # Configure logging. Adjust level and formatting as needed.
@@ -77,14 +76,20 @@ class ParentPipe:
 
             except (EOFError, BrokenPipeError, OSError) as e:
                 # When the other end has closed or an error occurs,
-                # log and notify the waiting thread.
-                logger.debug("[%s] Worker: pipe closed or error occurred (%s). Shutting down.", self.name, e)
-                request["result_queue"].put(None)
+                # log and notify the waiting thread and mark as closed.
+                logger.error(
+                    "[%s] Worker: pipe closed or error occurred (%s). Shutting down.",
+                    self.name,
+                    e,
+                )
+                request["result_queue"].put(e)
+                self._closed = True
                 break
 
             except Exception as e:
                 logger.exception("[%s] Worker: unexpected error.", self.name)
                 request["result_queue"].put(e)
+                self._closed = True
                 break
 
         logger.debug("[%s] Worker: stopping.", self.name)
@@ -99,7 +104,7 @@ class ParentPipe:
         """
         if self._closed:
             logger.debug("[%s] send() called but pipe is already closed", self.name)
-            return
+            raise BrokenPipeError(f"{self.name} is closed")
         logger.debug("[%s] send() requested with: %s", self.name, data)
         result_queue = queue.Queue()
         request = {
@@ -108,7 +113,22 @@ class ParentPipe:
             "result_queue": result_queue
         }
         self._request_queue.put(request)
-        result_queue.get()  # Wait until sending completes.
+
+        result = None
+        while True:
+            try:
+                # Wait until sending completes or detect worker failure.
+                result = result_queue.get(timeout=0.5)
+                break
+            except queue.Empty:
+                if not self._worker_thread.is_alive():
+                    raise RuntimeError(f"{self.name} worker thread is not running")
+                if self._closed:
+                    raise BrokenPipeError(f"{self.name} is closed")
+                continue
+
+        if isinstance(result, Exception):
+            raise result
         logger.debug("[%s] send() completed", self.name)
 
     def recv(self):
@@ -117,7 +137,7 @@ class ParentPipe:
         """
         if self._closed:
             logger.debug("[%s] recv() called but pipe is already closed", self.name)
-            return None
+            raise BrokenPipeError(f"{self.name} is closed")
         logger.debug("[%s] recv() requested", self.name)
         result_queue = queue.Queue()
         request = {
@@ -125,7 +145,21 @@ class ParentPipe:
             "result_queue": result_queue
         }
         self._request_queue.put(request)
-        data = result_queue.get()
+
+        data = None
+        while True:
+            try:
+                data = result_queue.get(timeout=0.5)
+                break
+            except queue.Empty:
+                if not self._worker_thread.is_alive():
+                    raise RuntimeError(f"{self.name} worker thread is not running")
+                if self._closed:
+                    raise BrokenPipeError(f"{self.name} is closed")
+                continue
+
+        if isinstance(data, Exception):
+            raise data
 
         # Log a preview for huge byte blobs.
         if isinstance(data, tuple) and len(data) == 2 and isinstance(data[1], bytes):
@@ -141,6 +175,7 @@ class ParentPipe:
         Returns True if data is ready, or False otherwise.
         """
         if self._closed:
+            logger.debug("[%s] poll() called but pipe is already closed", self.name)
             return False
         logger.debug("[%s] poll() requested with timeout: %s", self.name, timeout)
         result_queue = queue.Queue()
@@ -154,9 +189,14 @@ class ParentPipe:
             # Use a slightly longer timeout to give the worker a chance.
             result = result_queue.get(timeout=timeout + 0.1)
         except queue.Empty:
+            if not self._worker_thread.is_alive():
+                raise RuntimeError(f"{self.name} worker thread is not running")
             result = False
+
+        if isinstance(result, Exception):
+            raise result
         logger.debug("[%s] poll() returning => %s", self.name, result)
-        return result
+        return bool(result)
 
     def close(self):
         """

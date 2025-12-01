@@ -48,7 +48,13 @@ class AudioInput:
                     input_format=self.audio_format,  # Changed to input_format
                 ):
                     supported_rates.append(rate)
-            except:
+            except Exception as exc:
+                logging.debug(
+                    "Sample rate %s not supported on device %s: %s",
+                    rate,
+                    device_index,
+                    exc,
+                )
                 continue
         return supported_rates
 

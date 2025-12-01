@@ -62,9 +62,6 @@ import gc
 logger = logging.getLogger("realtimestt")
 logger.propagate = False
 
-# Set OpenMP runtime duplicate library handling to OK (Use only for development!)
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
 INIT_MODEL_TRANSCRIPTION = "tiny"
 INIT_MODEL_TRANSCRIPTION_REALTIME = "tiny"
 INIT_REALTIME_PROCESSING_PAUSE = 0.2
@@ -979,9 +976,10 @@ class AudioToTextRecorder:
                     logger.debug("Receive from stdout pipe")
                     message = self.parent_stdout_pipe.recv()
                     logger.info(message)
-            except (BrokenPipeError, EOFError, OSError):
-                # The pipe probably has been closed, so we ignore the error
-                pass
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                # The pipe has been closed or is no longer usable; log and exit the loop.
+                logger.info("Stdout pipe closed or unavailable: %s", exc)
+                break
             except KeyboardInterrupt:  # handle manual interruption (Ctrl+C)
                 logger.info("KeyboardInterrupt in read from stdout detected, exiting...")
                 break
@@ -1030,11 +1028,17 @@ class AudioToTextRecorder:
             )
         )
 
-        self.transcription_supervisor_thread = threading.Thread(
-            target=self._supervise_transcription_worker,
-            daemon=True
-        )
-        self.transcription_supervisor_thread.start()
+        # Start supervisor thread only once; it will handle restarts.
+        if (
+            not hasattr(self, "transcription_supervisor_thread")
+            or self.transcription_supervisor_thread is None
+            or not self.transcription_supervisor_thread.is_alive()
+        ):
+            self.transcription_supervisor_thread = threading.Thread(
+                target=self._supervise_transcription_worker,
+                daemon=True,
+            )
+            self.transcription_supervisor_thread.start()
 
     def _restart_transcription_worker(self):
         # Stop/cleanup the old worker
@@ -1046,15 +1050,6 @@ class AudioToTextRecorder:
                     logger.warning("Killing stuck transcription process")
                     try:
                         self.transcript_process.terminate()
-                    except Exception:
-                        pass
-
-                self.transcription_supervisor_thread.join(timeout=5)
-                if (hasattr(self.transcription_supervisor_thread, "is_alive") and
-                        self.transcription_supervisor_thread.is_alive()):
-                    logger.warning("Killing stuck transcription supervisor thread")
-                    try:
-                        self.transcription_supervisor_thread.terminate()
                     except Exception:
                         pass
 
@@ -1085,13 +1080,6 @@ class AudioToTextRecorder:
 
     def _supervise_transcription_worker(self):
         FATAL_CHECK_INTERVAL = 1.0  # seconds
-
-        # If the thread is already running, wait a bit and check again. Avoid multiple running at once
-        if hasattr(self, "transcription_supervisor_thread") and self.transcription_supervisor_thread is not None:
-            if self.transcription_supervisor_thread.is_alive():
-                time.sleep(2 * FATAL_CHECK_INTERVAL)
-                if self.transcription_supervisor_thread.is_alive():
-                    return
 
         # Wait until fatal is signaled or shutdown is in progress
         while not self.shutdown_event.is_set():
@@ -2699,13 +2687,14 @@ class AudioToTextRecorder:
         fragments get processed e.g. after waking up the recorder.
         """
         self.audio_buffer.clear()
-        try:
-            while True:
+        while True:
+            try:
                 self.audio_queue.get_nowait()
-        except:
-            # PyTorch's mp.Queue doesn't have a specific Empty exception
-            # so we catch any exception that might occur when the queue is empty
-            pass
+            except Exception as exc:
+                # PyTorch's mp.Queue doesn't expose a specific Empty exception consistently;
+                # any failure here just means there is nothing more to clear.
+                logger.debug("Stopped clearing audio queue: %s", exc)
+                break
 
     def _is_voice_active(self):
         """
