@@ -67,16 +67,10 @@ class AudioInput:
             if desired_rate in supported_rates:
                 return desired_rate
 
-            return max(supported_rates)
+            if supported_rates:
+                return max(supported_rates)
 
-            # lower_rates = [r for r in supported_rates if r <= desired_rate]
-            # if lower_rates:
-            #     return max(lower_rates)
-
-            # higher_rates = [r for r in supported_rates if r > desired_rate]
-            # if higher_rates:
-            #     return min(higher_rates)
-
+            # Fallback to device default if no supported rates found
             return int(device_info.get('defaultSampleRate', 44100))
 
         except Exception as e:
@@ -210,6 +204,8 @@ class AudioInput:
 
     def read_chunk(self):
         """Read a chunk of audio data"""
+        if self.stream is None:
+            raise RuntimeError("Audio stream is not initialized. Call setup() first.")
         return self.stream.read(self.chunk_size, exception_on_overflow=False)
 
     def cleanup(self):

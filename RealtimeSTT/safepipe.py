@@ -11,9 +11,7 @@ logger = logging.getLogger(__name__)
 
 try:
     # Only set the start method if it hasn't been set already.
-    if sys.platform.startswith('linux') or sys.platform == 'darwin':  # For Linux or macOS
-        mp.set_start_method("spawn")
-    elif mp.get_start_method(allow_none=True) is None:
+    if mp.get_start_method(allow_none=True) is None:
         mp.set_start_method("spawn")
 except RuntimeError as e:
     logger.debug("Start method has already been set. Details: %s", e)

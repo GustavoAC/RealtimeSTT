@@ -133,11 +133,10 @@ class TranscriptionWorker:
                 logging.error(f"Error receiving data from connection: {e}", exc_info=True)
                 self.fatal_event.set()
 
-
     def run(self):
         if __name__ == "__main__":
-             system_signal.signal(system_signal.SIGINT, system_signal.SIG_IGN)
-             __builtins__['print'] = self.custom_print
+            system_signal.signal(system_signal.SIGINT, system_signal.SIG_IGN)
+            __builtins__['print'] = self.custom_print
 
         logging.info(f"Initializing faster_whisper main transcription model {self.model_path}")
 
@@ -154,13 +153,16 @@ class TranscriptionWorker:
                 model = BatchedInferencePipeline(model=model)
 
             # Run a warm-up transcription
-            current_dir = os.path.dirname(os.path.realpath(__file__))
-            warmup_audio_path = os.path.join(
-                current_dir, "warmup_audio.wav"
-            )
-            warmup_audio_data, _ = sf.read(warmup_audio_path, dtype="float32")
-            segments, info = model.transcribe(warmup_audio_data, language="en", beam_size=1)
-            model_warmup_transcription = " ".join(segment.text for segment in segments)
+            try:
+                current_dir = os.path.dirname(os.path.realpath(__file__))
+                warmup_audio_path = os.path.join(
+                    current_dir, "warmup_audio.wav"
+                )
+                warmup_audio_data, _ = sf.read(warmup_audio_path, dtype="float32")
+                segments, info = model.transcribe(warmup_audio_data, language="en", beam_size=1)
+                _ = " ".join(segment.text for segment in segments)
+            except Exception as e:
+                logging.warning(f"Could not perform warmup transcription: {e}. Continuing without warmup.")
         except Exception as e:
             logging.exception(f"Error initializing main faster_whisper transcription model: {e}")
             raise
@@ -230,7 +232,9 @@ class TranscriptionWorker:
                 except Exception as e:
                     logging.error(f"General error in processing queue item: {e}", exc_info=True)
         finally:
-            __builtins__['print'] = print  # Restore the original print function
+            import builtins
+            if hasattr(self, '_original_print'):
+                builtins.print = self._original_print  # Restore the original print function
             self.conn.close()
             self.stdout_pipe.close()
             self.shutdown_event.set()  # Ensure the polling thread will stop
@@ -2206,7 +2210,7 @@ class AudioToTextRecorder:
                             else:
                                 self.frames[0] = frame[wakeword_samples_to_remove * 2:]
                                 samples_removed += wakeword_samples_to_remove
-                                samples_to_remove = 0
+                                wakeword_samples_to_remove = 0
                         
                         wakeword_samples_to_remove = 0
 

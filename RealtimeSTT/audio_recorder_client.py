@@ -272,6 +272,12 @@ class AudioToTextRecorderClient:
         self.request_counter = 0
         self.pending_requests = {}  # Map from request_id to threading.Event and value
 
+        # Initialize WebSocket attributes to None (will be set in connect())
+        self.control_ws = None
+        self.data_ws = None
+        self.control_ws_thread = None
+        self.data_ws_thread = None
+
         if self.debug_mode:
             print("Checking STT server")
         if not self.connect():
@@ -361,8 +367,11 @@ class AudioToTextRecorderClient:
         message = struct.pack('<I', metadata_length) + metadata_json.encode('utf-8') + chunk
 
         # Send the message if the connection is running
-        if self.is_running:
-            self.data_ws.send(message, opcode=ABNF.OPCODE_BINARY)
+        if self.is_running and self.data_ws:
+            try:
+                self.data_ws.send(message, opcode=ABNF.OPCODE_BINARY)
+            except Exception as e:
+                print(f"Error sending audio data: {e}")
 
     def set_microphone(self, microphone_on=True):
         """
@@ -633,10 +642,13 @@ class AudioToTextRecorderClient:
                         metadata_length = len(metadata_json)
                         message = struct.pack('<I', metadata_length) + metadata_json.encode('utf-8') + audio_data
 
-                        if self.is_running:
+                        if self.is_running and self.data_ws:
                             if log_outgoing_chunks:
                                 print(".", flush=True, end='')
-                            self.data_ws.send(message, opcode=ABNF.OPCODE_BINARY)
+                            try:
+                                self.data_ws.send(message, opcode=ABNF.OPCODE_BINARY)
+                            except Exception:
+                                pass  # Silently ignore send errors during recording
                 except KeyboardInterrupt:
                     if self.debug_mode:
                         print("KeyboardInterrupt in record_and_send_audio, exiting...")
@@ -783,14 +795,22 @@ class AudioToTextRecorderClient:
             print("Data WebSocket connection opened.")
 
     def set_parameter(self, parameter, value):
+        if not self.control_ws or not self.is_running:
+            return
         command = {
             "command": "set_parameter",
             "parameter": parameter,
             "value": value
         }
-        self.control_ws.send(json.dumps(command))
+        try:
+            self.control_ws.send(json.dumps(command))
+        except Exception as e:
+            print(f"Error setting parameter: {e}")
 
     def get_parameter(self, parameter):
+        if not self.control_ws or not self.is_running:
+            return None
+            
         # Generate a unique request_id
         request_id = self.request_counter
         self.request_counter += 1
@@ -807,7 +827,12 @@ class AudioToTextRecorderClient:
         self.pending_requests[request_id] = {'event': event, 'value': None}
 
         # Send the command to the server
-        self.control_ws.send(json.dumps(command))
+        try:
+            self.control_ws.send(json.dumps(command))
+        except Exception as e:
+            print(f"Error getting parameter: {e}")
+            del self.pending_requests[request_id]
+            return None
 
         # Wait for the response or timeout after 5 seconds
         if event.wait(timeout=5):
@@ -822,29 +847,50 @@ class AudioToTextRecorderClient:
             return None
 
     def call_method(self, method, args=None, kwargs=None):
+        if not self.control_ws or not self.is_running:
+            return
         command = {
             "command": "call_method",
             "method": method,
             "args": args or [],
             "kwargs": kwargs or {}
         }
-        self.control_ws.send(json.dumps(command))
+        try:
+            self.control_ws.send(json.dumps(command))
+        except Exception as e:
+            print(f"Error calling method {method}: {e}")
 
     def shutdown(self):
         """Shutdown all resources"""
         self.is_running = False
-        if self.control_ws:
-            self.control_ws.close()
-        if self.data_ws:
-            self.data_ws.close()
+        
+        # Close WebSocket connections
+        try:
+            if self.control_ws:
+                self.control_ws.close()
+        except Exception:
+            pass
+        try:
+            if self.data_ws:
+                self.data_ws.close()
+        except Exception:
+            pass
 
-        # Join threads
+        # Join threads with timeout to prevent hanging
         if self.control_ws_thread:
-            self.control_ws_thread.join()
+            self.control_ws_thread.join(timeout=5)
         if self.data_ws_thread:
-            self.data_ws_thread.join()
+            self.data_ws_thread.join(timeout=5)
         if self.recording_thread:
-            self.recording_thread.join()
+            self.recording_thread.join(timeout=5)
+
+        # Close WAV file if open
+        if self.wav_file:
+            try:
+                self.wav_file.close()
+            except Exception:
+                pass
+            self.wav_file = None
 
         # Clean up audio
         self.cleanup_audio()
