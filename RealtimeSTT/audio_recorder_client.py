@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional, Union
 from urllib.parse import urlparse
 from datetime import datetime
 from websocket import WebSocketApp
-from websocket import ABNF
+from websocket import ABNF, WebSocketConnectionClosedException
 import numpy as np
 import subprocess
 import threading
@@ -299,6 +299,37 @@ class AudioToTextRecorderClient:
                 self.set_parameter("wake_word_activation_delay", self.wake_word_activation_delay)
                 print(f"Wake word activation delay set to {self.wake_word_activation_delay}")
 
+    def _ws_connected(self, ws: WebSocketApp) -> bool:
+        if ws is None:
+            return False
+        sock = ws.sock
+        return bool(sock and sock.connected)
+
+    def _safe_ws_send(self, ws: WebSocketApp, payload, opcode=None) -> bool:
+        """
+        Send data to a websocket only when it is still connected.
+        This avoids raising when the remote peer has already initiated closure.
+        """
+        if not self._ws_connected(ws):
+            if self.debug_mode:
+                print("Skipping send because websocket is closed or closing.")
+            return False
+        try:
+            if opcode is None:
+                ws.send(payload)
+            else:
+                ws.send(payload, opcode=opcode)
+            return True
+        except WebSocketConnectionClosedException as exc:
+            if self.debug_mode:
+                print(f"WebSocket closed while sending: {exc}")
+            self.is_running = False
+            return False
+        except Exception as exc:
+            if self.debug_mode:
+                print(f"Error sending over websocket: {exc}")
+            return False
+
     def text(self, on_transcription_finished=None):
         self.realtime_text = ""
         self.submitted_realtime_text = ""
@@ -367,11 +398,9 @@ class AudioToTextRecorderClient:
         message = struct.pack('<I', metadata_length) + metadata_json.encode('utf-8') + chunk
 
         # Send the message if the connection is running
-        if self.is_running and self.data_ws:
-            try:
-                self.data_ws.send(message, opcode=ABNF.OPCODE_BINARY)
-            except Exception as e:
-                print(f"Error sending audio data: {e}")
+        if self.is_running:
+            if not self._safe_ws_send(self.data_ws, message, opcode=ABNF.OPCODE_BINARY):
+                print("Dropping audio chunk because data websocket is closed.")
 
     def set_microphone(self, microphone_on=True):
         """
@@ -642,13 +671,10 @@ class AudioToTextRecorderClient:
                         metadata_length = len(metadata_json)
                         message = struct.pack('<I', metadata_length) + metadata_json.encode('utf-8') + audio_data
 
-                        if self.is_running and self.data_ws:
+                        if self.is_running:
                             if log_outgoing_chunks:
                                 print(".", flush=True, end='')
-                            try:
-                                self.data_ws.send(message, opcode=ABNF.OPCODE_BINARY)
-                            except Exception:
-                                pass  # Silently ignore send errors during recording
+                            self._safe_ws_send(self.data_ws, message, opcode=ABNF.OPCODE_BINARY)
                 except KeyboardInterrupt:
                     if self.debug_mode:
                         print("KeyboardInterrupt in record_and_send_audio, exiting...")
@@ -802,10 +828,8 @@ class AudioToTextRecorderClient:
             "parameter": parameter,
             "value": value
         }
-        try:
-            self.control_ws.send(json.dumps(command))
-        except Exception as e:
-            print(f"Error setting parameter: {e}")
+        if not self._safe_ws_send(self.control_ws, json.dumps(command)):
+            print(f"Error setting parameter {parameter}: websocket not available")
 
     def get_parameter(self, parameter):
         if not self.control_ws or not self.is_running:
@@ -827,10 +851,8 @@ class AudioToTextRecorderClient:
         self.pending_requests[request_id] = {'event': event, 'value': None}
 
         # Send the command to the server
-        try:
-            self.control_ws.send(json.dumps(command))
-        except Exception as e:
-            print(f"Error getting parameter: {e}")
+        if not self._safe_ws_send(self.control_ws, json.dumps(command)):
+            print(f"Error getting parameter {parameter}: websocket not available")
             del self.pending_requests[request_id]
             return None
 
@@ -855,10 +877,8 @@ class AudioToTextRecorderClient:
             "args": args or [],
             "kwargs": kwargs or {}
         }
-        try:
-            self.control_ws.send(json.dumps(command))
-        except Exception as e:
-            print(f"Error calling method {method}: {e}")
+        if not self._safe_ws_send(self.control_ws, json.dumps(command)):
+            print(f"Error calling method {method}: websocket not available")
 
     def shutdown(self):
         """Shutdown all resources"""

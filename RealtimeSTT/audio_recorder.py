@@ -129,9 +129,17 @@ class TranscriptionWorker:
                 data = self.conn.recv()
                 self.queue.put(data)
 
+            except (EOFError, BrokenPipeError, OSError) as exc:
+                if self.shutdown_event.is_set():
+                    logging.debug("Connection closed during shutdown: %s", exc)
+                else:
+                    logging.error("Error receiving data from connection: %s", exc, exc_info=True)
+                    self.fatal_event.set()
+                break
             except Exception as e:
                 logging.error(f"Error receiving data from connection: {e}", exc_info=True)
                 self.fatal_event.set()
+                break
 
     def run(self):
         if __name__ == "__main__":
@@ -190,7 +198,11 @@ class TranscriptionWorker:
                                     audio = (audio / peak) * 0.95
                         else:
                             logging.error("Received None audio for transcription")
-                            self.conn.send(('error', "Received None audio for transcription"))
+                            try:
+                                self.conn.send(('error', "Received None audio for transcription"))
+                            except (BrokenPipeError, EOFError, OSError) as exc:
+                                logging.debug("Pipe closed while sending None-audio error: %s", exc)
+                                break
                             continue
 
                         prompt = None
@@ -219,10 +231,18 @@ class TranscriptionWorker:
                         elapsed = time.time() - start_t
                         transcription = " ".join(seg.text for seg in segments).strip()
                         logging.debug(f"Final text detected with main model: {transcription} in {elapsed:.4f}s")
-                        self.conn.send(('success', (transcription, info)))
+                        try:
+                            self.conn.send(('success', (transcription, info)))
+                        except (BrokenPipeError, EOFError, OSError) as exc:
+                            logging.debug("Pipe closed while sending transcription result: %s", exc)
+                            break
                     except Exception as e:
                         logging.error(f"General error in transcription: {e}", exc_info=True)
-                        self.conn.send(('error', str(e)))
+                        try:
+                            self.conn.send(('error', str(e)))
+                        except (BrokenPipeError, EOFError, OSError) as exc:
+                            logging.debug("Pipe closed while sending error response: %s", exc)
+                            break
                 except queue.Empty:
                     continue
                 except KeyboardInterrupt:
